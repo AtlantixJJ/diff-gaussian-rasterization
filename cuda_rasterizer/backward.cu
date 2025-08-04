@@ -423,10 +423,11 @@ renderCUDA(
 	const float4* __restrict__ conic_opacity,
 	const float* __restrict__ colors,
 	const float* __restrict__ depths,
-	const float* __restrict__ final_Ts,
+	const float* __restrict__ alphas,
 	const uint32_t* __restrict__ n_contrib,
 	const float* __restrict__ dL_dpixels,
 	const float* __restrict__ dL_dpixel_depths,
+	const float* __restrict__ dL_dalphas,
 	float3* __restrict__ dL_dmean2D,
 	float4* __restrict__ dL_dconic2D,
 	float* __restrict__ dL_dopacity,
@@ -458,7 +459,7 @@ renderCUDA(
 
 	// In the forward, we stored the final value for T, the
 	// product of all (1 - alpha) factors. 
-	const float T_final = inside ? final_Ts[pix_id] : 0;
+	const float T_final = inside ? (1 - alphas[pix_id]) : 0;
 	float T = T_final;
 
 	// We start from the back. The ID of the last contributing
@@ -470,10 +471,13 @@ renderCUDA(
 	float dL_dpixel[C];
 	float dL_dpixel_depth;
 	float accum_depth_rec = 0;
+	float accum_alpha_rec = 0;
+	float dL_dalpha;
 	if (inside){
 		for (int i = 0; i < C; i++)
 			dL_dpixel[i] = dL_dpixels[i * H * W + pix_id];
 		dL_dpixel_depth = dL_dpixel_depths[pix_id];
+		dL_dalpha = dL_dalphas[pix_id];
 	}
 
 	float last_alpha = 0;
@@ -554,6 +558,9 @@ renderCUDA(
 			last_depth = c_d;
 			dL_dalpha += (c_d - accum_depth_rec) * dL_dpixel_depth;
 			atomicAdd(&(dL_ddepths[global_id]), dpixel_depth_ddepth * dL_dpixel_depth);
+
+			accum_alpha_rec = last_alpha + (1.f - last_alpha) * accum_alpha_rec;
+			dL_dalpha += (1 - accum_alpha_rec) * dL_dalpha;
 
 			dL_dalpha *= T;
 			// Update last alpha (to be used in the next iteration)
@@ -667,10 +674,11 @@ void BACKWARD::render(
 	const float4* conic_opacity,
 	const float* colors,
 	const float* depths,
-	const float* final_Ts,
+	const float* alphas,
 	const uint32_t* n_contrib,
 	const float* dL_dpixels,
 	const float* dL_dpixel_depths,
+	const float* dL_dalphas,
 	float3* dL_dmean2D,
 	float4* dL_dconic2D,
 	float* dL_dopacity,
@@ -686,10 +694,11 @@ void BACKWARD::render(
 		conic_opacity,
 		colors,
 		depths,
-		final_Ts,
+		alphas,
 		n_contrib,
 		dL_dpixels,
 		dL_dpixel_depths,
+		dL_dalphas,
 		dL_dmean2D,
 		dL_dconic2D,
 		dL_dopacity,
