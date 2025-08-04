@@ -217,6 +217,8 @@ int CudaRasterizer::Rasterizer::forward(
 	const bool prefiltered,
 	float* out_color,
 	float* out_depth,
+	float* out_alpha,
+	float* out_pointmap,
 	int* radii,
 	bool debug)
 {
@@ -328,12 +330,14 @@ int CudaRasterizer::Rasterizer::forward(
 		geomState.means2D,
 		feature_ptr,
 		geomState.depths,
+		means3D,
 		geomState.conic_opacity,
-		imgState.accum_alpha,
+		out_alpha,
 		imgState.n_contrib,
 		background,
 		out_color,
-		out_depth), debug)
+		out_depth,
+		out_pointmap), debug)
 
 	return num_rendered;
 }
@@ -361,6 +365,8 @@ void CudaRasterizer::Rasterizer::backward(
 	char* img_buffer,
 	const float* dL_dpix,
 	const float* dL_dpix_depth,
+	const float* dL_dalpha,
+	const float* dL_dpointmap,
 	float* dL_dmean2D,
 	float* dL_dconic,
 	float* dL_dopacity,
@@ -393,6 +399,11 @@ void CudaRasterizer::Rasterizer::backward(
 	// If we were given precomputed colors and not SHs, use them.
 	const float* color_ptr = (colors_precomp != nullptr) ? colors_precomp : geomState.rgb;
 	const float* depth_ptr = geomState.depths;
+	// Create temporary buffer for pointmap gradients that will be handled in preprocess
+	float* dL_dpointmap_means;
+	CHECK_CUDA(cudaMalloc(&dL_dpointmap_means, P * 3 * sizeof(float)), debug);
+	CHECK_CUDA(cudaMemset(dL_dpointmap_means, 0, P * 3 * sizeof(float)), debug);
+
 	CHECK_CUDA(BACKWARD::render(
 		tile_grid,
 		block,
@@ -404,15 +415,19 @@ void CudaRasterizer::Rasterizer::backward(
 		geomState.conic_opacity,
 		color_ptr,
 		depth_ptr,
+		means3D,
 		imgState.accum_alpha,
 		imgState.n_contrib,
 		dL_dpix,
 		dL_dpix_depth,
+		dL_dalpha,
+		dL_dpointmap,
 		(float3*)dL_dmean2D,
 		(float4*)dL_dconic,
 		dL_dopacity,
 		dL_dcolor,
-		dL_ddepth), debug)
+		dL_ddepth,
+		dL_dpointmap_means), debug)
 
 	// Take care of the rest of preprocessing. Was the precomputed covariance
 	// given to us or a scales/rot pair? If precomputed, pass that. If not,
@@ -440,5 +455,9 @@ void CudaRasterizer::Rasterizer::backward(
 		dL_dcov3D,
 		dL_dsh,
 		(glm::vec3*)dL_dscale,
-		(glm::vec4*)dL_drot), debug)
+		(glm::vec4*)dL_drot,
+		dL_dpointmap_means), debug)
+	
+	// Clean up
+	CHECK_CUDA(cudaFree(dL_dpointmap_means), debug);
 }

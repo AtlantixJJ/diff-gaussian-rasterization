@@ -363,7 +363,8 @@ __global__ void preprocessCUDA(
 	float* dL_dcov3D,
 	float* dL_dsh,
 	glm::vec3* dL_dscale,
-	glm::vec4* dL_drot)
+	glm::vec4* dL_drot,
+	const float* dL_dpointmap_means)
 {
 	auto idx = cg::this_grid().thread_rank();
 	if (idx >= P || !(radii[idx] > 0))
@@ -409,6 +410,11 @@ __global__ void preprocessCUDA(
 	// Compute gradient updates due to computing covariance from scale/rotation
 	if (scales)
 		computeCov3D(idx, scales[idx], scale_modifier, rotations[idx], dL_dcov3D, dL_dscale, dL_drot);
+
+	// Accumulate gradients from pointmap rendering
+	dL_dmeans[idx].x += dL_dpointmap_means[idx * 3 + 0];
+	dL_dmeans[idx].y += dL_dpointmap_means[idx * 3 + 1];
+	dL_dmeans[idx].z += dL_dpointmap_means[idx * 3 + 2];
 }
 
 // Backward version of the rendering procedure.
@@ -423,15 +429,19 @@ renderCUDA(
 	const float4* __restrict__ conic_opacity,
 	const float* __restrict__ colors,
 	const float* __restrict__ depths,
-	const float* __restrict__ final_Ts,
+	const float* __restrict__ means3D,
+	const float* __restrict__ alphas,
 	const uint32_t* __restrict__ n_contrib,
 	const float* __restrict__ dL_dpixels,
 	const float* __restrict__ dL_dpixel_depths,
+	const float* __restrict__ dL_dalphas,
+	const float* __restrict__ dL_dpointmap,
 	float3* __restrict__ dL_dmean2D,
 	float4* __restrict__ dL_dconic2D,
 	float* __restrict__ dL_dopacity,
 	float* __restrict__ dL_dcolors,
-	float* __restrict__ dL_ddepths)
+	float* __restrict__ dL_ddepths,
+	float* __restrict__ dL_dpointmap_means)
 {
 	// We rasterize again. Compute necessary block info.
 	auto block = cg::this_thread_block();
@@ -455,10 +465,11 @@ renderCUDA(
 	__shared__ float4 collected_conic_opacity[BLOCK_SIZE];
 	__shared__ float collected_colors[C * BLOCK_SIZE];
 	__shared__ float collected_depths[BLOCK_SIZE];
+	__shared__ float collected_means3D[3 * BLOCK_SIZE];
 
 	// In the forward, we stored the final value for T, the
 	// product of all (1 - alpha) factors. 
-	const float T_final = inside ? final_Ts[pix_id] : 0;
+	const float T_final = inside ? (1 - alphas[pix_id]) : 0;
 	float T = T_final;
 
 	// We start from the back. The ID of the last contributing
@@ -469,16 +480,25 @@ renderCUDA(
 	float accum_rec[C] = { 0 };
 	float dL_dpixel[C];
 	float dL_dpixel_depth;
+	float dL_dpixel_pointmap[3];
 	float accum_depth_rec = 0;
+	float accum_pointmap_rec[3] = { 0 };
+	float accum_alpha_rec = 0;
+	float dL_dalpha;
 	if (inside){
 		for (int i = 0; i < C; i++)
 			dL_dpixel[i] = dL_dpixels[i * H * W + pix_id];
 		dL_dpixel_depth = dL_dpixel_depths[pix_id];
+		dL_dalpha = dL_dalphas[pix_id];
+		dL_dpixel_pointmap[0] = dL_dpointmap[pix_id * 3 + 0];
+		dL_dpixel_pointmap[1] = dL_dpointmap[pix_id * 3 + 1];
+		dL_dpixel_pointmap[2] = dL_dpointmap[pix_id * 3 + 2];
 	}
 
 	float last_alpha = 0;
 	float last_color[C] = { 0 };
 	float last_depth = 0;
+	float last_pointmap[3] = { 0 };
 
 	// Gradient of pixel coordinate w.r.t. normalized 
 	// screen-space viewport corrdinates (-1 to 1)
@@ -501,6 +521,9 @@ renderCUDA(
 			for (int i = 0; i < C; i++)
 				collected_colors[i * BLOCK_SIZE + block.thread_rank()] = colors[coll_id * C + i];
 			collected_depths[block.thread_rank()] = depths[coll_id];
+			collected_means3D[0 * BLOCK_SIZE + block.thread_rank()] = means3D[coll_id * 3 + 0];
+			collected_means3D[1 * BLOCK_SIZE + block.thread_rank()] = means3D[coll_id * 3 + 1];
+			collected_means3D[2 * BLOCK_SIZE + block.thread_rank()] = means3D[coll_id * 3 + 2];
 		}
 		block.sync();
 
@@ -554,6 +577,24 @@ renderCUDA(
 			last_depth = c_d;
 			dL_dalpha += (c_d - accum_depth_rec) * dL_dpixel_depth;
 			atomicAdd(&(dL_ddepths[global_id]), dpixel_depth_ddepth * dL_dpixel_depth);
+
+			accum_alpha_rec = last_alpha + (1.f - last_alpha) * accum_alpha_rec;
+			dL_dalpha += (1 - accum_alpha_rec) * dL_dalpha;
+
+			// Handle pointmap gradients
+			const float c_p[3] = {
+				collected_means3D[0 * BLOCK_SIZE + j],
+				collected_means3D[1 * BLOCK_SIZE + j],
+				collected_means3D[2 * BLOCK_SIZE + j]
+			};
+			const float dpixel_pointmap_dpoint = alpha * T;
+			for (int dim = 0; dim < 3; dim++) {
+				accum_pointmap_rec[dim] = last_alpha * last_pointmap[dim] + (1.f - last_alpha) * accum_pointmap_rec[dim];
+				last_pointmap[dim] = c_p[dim];
+				dL_dalpha += (c_p[dim] - accum_pointmap_rec[dim]) * dL_dpixel_pointmap[dim];
+				// Store gradient w.r.t. means3D from pointmap rendering (to be processed in preprocessCUDA)
+				atomicAdd(&(dL_dpointmap_means[global_id * 3 + dim]), dpixel_pointmap_dpoint * dL_dpixel_pointmap[dim]);
+			}
 
 			dL_dalpha *= T;
 			// Update last alpha (to be used in the next iteration)
@@ -612,7 +653,8 @@ void BACKWARD::preprocess(
 	float* dL_dcov3D,
 	float* dL_dsh,
 	glm::vec3* dL_dscale,
-	glm::vec4* dL_drot)
+	glm::vec4* dL_drot,
+	const float* dL_dpointmap_means)
 {
 	// Propagate gradients for the path of 2D conic matrix computation. 
 	// Somewhat long, thus it is its own kernel rather than being part of 
@@ -654,7 +696,8 @@ void BACKWARD::preprocess(
 		dL_dcov3D,
 		dL_dsh,
 		dL_dscale,
-		dL_drot);
+		dL_drot,
+		dL_dpointmap_means);
 }
 
 void BACKWARD::render(
@@ -667,15 +710,19 @@ void BACKWARD::render(
 	const float4* conic_opacity,
 	const float* colors,
 	const float* depths,
-	const float* final_Ts,
+	const float* means3D,
+	const float* alphas,
 	const uint32_t* n_contrib,
 	const float* dL_dpixels,
 	const float* dL_dpixel_depths,
+	const float* dL_dalphas,
+	const float* dL_dpointmap,
 	float3* dL_dmean2D,
 	float4* dL_dconic2D,
 	float* dL_dopacity,
 	float* dL_dcolors,
-	float* dL_ddepths)
+	float* dL_ddepths,
+	float* dL_dpointmap_means)
 {
 	renderCUDA<NUM_CHANNELS> << <grid, block >> >(
 		ranges,
@@ -686,14 +733,18 @@ void BACKWARD::render(
 		conic_opacity,
 		colors,
 		depths,
-		final_Ts,
+		means3D,
+		alphas,
 		n_contrib,
 		dL_dpixels,
 		dL_dpixel_depths,
+		dL_dalphas,
+		dL_dpointmap,
 		dL_dmean2D,
 		dL_dconic2D,
 		dL_dopacity,
 		dL_dcolors,
-		dL_ddepths
+		dL_ddepths,
+		dL_dpointmap_means
 		);
 }
