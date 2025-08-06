@@ -537,7 +537,7 @@ renderCUDA(
 			// Propagate gradients to per-Gaussian colors and keep
 			// gradients w.r.t. alpha (blending factor for a Gaussian/pixel
 			// pair).
-			float dL_dalpha = 0.0f;
+			float dL_dopa = 0.0f;
 			const int global_id = collected_id[j];
 			for (int ch = 0; ch < C; ch++)
 			{
@@ -547,7 +547,7 @@ renderCUDA(
 				last_color[ch] = c;
 
 				const float dL_dchannel = dL_dpixel[ch];
-				dL_dalpha += (c - accum_rec[ch]) * dL_dchannel;
+				dL_dopa += (c - accum_rec[ch]) * dL_dchannel;
 				// Update the gradients w.r.t. color of the Gaussian. 
 				// Atomic, since this pixel is just one of potentially
 				// many that were affected by this Gaussian.
@@ -556,13 +556,13 @@ renderCUDA(
 			const float c_d = collected_depths[j];
 			accum_depth_rec = last_alpha * last_depth + (1.f - last_alpha) * accum_depth_rec;
 			last_depth = c_d;
-			dL_dalpha += (c_d - accum_depth_rec) * dL_dpixel_depth;
+			dL_dopa += (c_d - accum_depth_rec) * dL_dpixel_depth;
 			atomicAdd(&(dL_ddepths[global_id]), dpixel_depth_ddepth * dL_dpixel_depth);
 
 			accum_alpha_rec = last_alpha + (1.f - last_alpha) * accum_alpha_rec;
-			dL_dalpha += (1 - accum_alpha_rec) * dL_dalpha;
+			dL_dopa += (1 - accum_alpha_rec) * dL_dalpha;
 
-			dL_dalpha *= T;
+			dL_dopa *= T;
 			// Update last alpha (to be used in the next iteration)
 			last_alpha = alpha;
 
@@ -571,11 +571,11 @@ renderCUDA(
 			float bg_dot_dpixel = 0;
 			for (int i = 0; i < C; i++)
 				bg_dot_dpixel += bg_color[i] * dL_dpixel[i];
-			dL_dalpha += (-T_final / (1.f - alpha)) * bg_dot_dpixel;
+			dL_dopa += (-T_final / (1.f - alpha)) * bg_dot_dpixel;
 
 
 			// Helpful reusable temporary variables
-			const float dL_dG = con_o.w * dL_dalpha;
+			const float dL_dG = con_o.w * dL_dopa;
 			const float gdx = G * d.x;
 			const float gdy = G * d.y;
 			const float dG_ddelx = -gdx * con_o.x - gdy * con_o.y;
@@ -591,7 +591,7 @@ renderCUDA(
 			atomicAdd(&dL_dconic2D[global_id].w, -0.5f * gdy * d.y * dL_dG);
 
 			// Update gradients w.r.t. opacity of the Gaussian
-			atomicAdd(&(dL_dopacity[global_id]), G * dL_dalpha);
+			atomicAdd(&(dL_dopacity[global_id]), G * dL_dopa);
 		}
 	}
 }
