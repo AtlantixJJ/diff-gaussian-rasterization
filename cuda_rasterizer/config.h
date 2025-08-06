@@ -13,6 +13,7 @@
 #define CUDA_RASTERIZER_CONFIG_H_INCLUDED
 
 #define NUM_CHANNELS 3 // Default 3, RGB
+#define RASTER_CHANNEL 8 // Maximum number of points to record per pixel for point indices
 #define BLOCK_X 16
 #define BLOCK_Y 16
 

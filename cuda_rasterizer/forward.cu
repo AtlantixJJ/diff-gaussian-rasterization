@@ -11,6 +11,7 @@
 
 #include "forward.h"
 #include "auxiliary.h"
+#include "config.h"
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
 namespace cg = cooperative_groups;
@@ -271,7 +272,9 @@ renderCUDA(
 	uint32_t* __restrict__ n_contrib,
 	const float* __restrict__ bg_color,
 	float* __restrict__ out_color,
-	float* __restrict__ out_depth)
+	float* __restrict__ out_depth,
+	uint32_t* __restrict__ out_pointindice,
+	float* __restrict__ out_pointcontrib)
 {
 	// Identify current tile and associated min/max pixel range.
 	auto block = cg::this_thread_block();
@@ -299,11 +302,17 @@ renderCUDA(
 
 	// Initialize helper variables
 	float T = 1.0f;
+	float contrib = 0.0f;
 	uint32_t contributor = 0;
 	uint32_t last_contributor = 0;
 	float C[CHANNELS] = { 0 };
 	float weight = 0;
 	float D = { 0 };
+
+	// Point indices tracking
+	uint32_t point_indices[RASTER_CHANNEL];
+	float point_contribs[RASTER_CHANNEL];
+	int stored_points = 0;
 
 	// Iterate over batches until all done or range is complete
 	for (int i = 0; i < rounds; i++, toDo -= BLOCK_SIZE)
@@ -354,10 +363,18 @@ renderCUDA(
 			}
 
 			// Eq. (3) from 3D Gaussian splatting paper.
+			contrib = alpha * T;
 			for (int ch = 0; ch < CHANNELS; ch++)
-				C[ch] += features[collected_id[j] * CHANNELS + ch] * alpha * T;
-			weight += alpha * T;
-			D += depths[collected_id[j]] * alpha * T;
+				C[ch] += features[collected_id[j] * CHANNELS + ch] * contrib;
+			weight += contrib;
+			D += depths[collected_id[j]] * contrib;
+
+			// Store point index and contribution, some j might be skipped
+			if (stored_points < RASTER_CHANNEL && contrib > 0.02f) {
+				point_indices[stored_points] = collected_id[j];
+				point_contribs[stored_points] = contrib;
+				stored_points++;
+			}
 
 			T = test_T;
 
@@ -376,6 +393,12 @@ renderCUDA(
 			out_color[ch * H * W + pix_id] = C[ch] + T * bg_color[ch];
 		out_alpha[pix_id] = weight; //1 - T;                 
 		out_depth[pix_id] = D;
+
+		// Write point indices and contributions
+		for (int ch = 0; ch < stored_points; ch++)
+			out_pointindice[ch * H * W + pix_id] = point_indices[ch];
+		for (int ch = 0; ch < stored_points; ch++)
+			out_pointcontrib[ch * H * W + pix_id] = point_contribs[ch];
 	}
 }
 
@@ -392,7 +415,9 @@ void FORWARD::render(
 	uint32_t* n_contrib,
 	const float* bg_color,
 	float* out_color,
-	float* out_depth)
+	float* out_depth,
+	uint32_t* out_pointindice,
+	float* out_pointcontrib)
 {
 	renderCUDA<NUM_CHANNELS> << <grid, block >> > (
 		ranges,
@@ -406,7 +431,9 @@ void FORWARD::render(
 		n_contrib,
 		bg_color,
 		out_color,
-		out_depth);
+		out_depth,
+		out_pointindice,
+		out_pointcontrib);
 }
 
 void FORWARD::preprocess(int P, int D, int M,
